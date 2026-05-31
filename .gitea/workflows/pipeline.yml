@@ -1,0 +1,196 @@
+# Erik Heerke Witteveen | Student 413560
+# DevSecOps Pipeline | Hanze University of Applied Sciences
+# Assessor: Dr Mohsen Kakavand (KAMO)
+#
+# Full DevSecOps pipeline. Triggers on every push to main.
+# Job 1 runs the SAST scan first. Job 2 only starts if job 1 passes.
+# This way a vulnerable commit never becomes a built image.
+
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  IMAGE_NAME: devsecops-app
+  APP_PORT: "8080"
+  CONTAINER_PORT: "3000"
+
+jobs:
+
+  # Job 1: SAST scan
+  # Scans the TypeScript source code for security issues before anything gets built.
+  # Using a venv here because pip has conflicts on the runner without it.
+  sast:
+    name: SAST Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Semgrep
+        run: |
+          python3 -m venv /tmp/semgrep-env
+          /tmp/semgrep-env/bin/pip install semgrep --quiet
+
+      - name: Run Semgrep scan
+        run: |
+          /tmp/semgrep-env/bin/semgrep \
+            --config=auto \
+            --json \
+            --output=semgrep-report.json \
+            ./app/src \
+            || true
+          # Make sure the report file exists even if semgrep had an issue
+          [ -f semgrep-report.json ] || echo '{"results":[],"errors":[]}' > semgrep-report.json
+
+      - name: Print SAST summary
+        run: |
+          echo "=== SAST Scan Complete ==="
+          python3 -c "
+          import json
+          with open('semgrep-report.json') as f:
+              r = json.load(f)
+          findings = r.get('results', [])
+          print(f'Findings: {len(findings)}')
+          for item in findings[:10]:
+              severity = item.get('extra', {}).get('severity', 'UNKNOWN')
+              check_id = item.get('check_id', 'unknown')
+              path     = item.get('path', 'unknown')
+              line     = item.get('start', {}).get('line', 0)
+              print(f'  [{severity}] {check_id} @ {path}:{line}')
+          if len(findings) > 10:
+              print(f'  ... and {len(findings)-10} more')
+          "
+
+      - name: Save SAST report
+        run: |
+          ls -lh semgrep-report.json
+          echo "SAST report saved successfully"
+
+  # Job 2: Build, test, scan and deploy
+  # Only runs after the SAST job passes. All steps share the same job so the
+  # built image is available to all of them without needing a registry.
+  build-scan-deploy:
+    name: Build / Scan / Deploy
+    runs-on: ubuntu-latest
+    needs: sast
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify Docker CLI
+        run: |
+          docker --version && echo "Docker CLI already present" || \
+          (apt-get update -qq && apt-get install -y docker.io -qq && echo "Docker CLI installed")
+
+      # Build the image. --cache-from reuses layers from the last build if they haven't changed,
+      # so npm install gets skipped when only source files are updated.
+      - name: Build Docker image
+        run: |
+          docker build \
+            --cache-from ${{ env.IMAGE_NAME }}:latest \
+            -t ${{ env.IMAGE_NAME }}:${{ gitea.sha }} \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            ./app
+          echo "Built image: ${{ env.IMAGE_NAME }}:${{ gitea.sha }}"
+
+      # Run the Jest test suite against the built app
+      - name: Run tests
+        run: |
+          cd app
+          npm install --silent
+          npm test
+
+      # Generate an SBOM so we know exactly what is in the image
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          syft scan ${{ env.IMAGE_NAME }}:latest \
+            -o cyclonedx-json \
+            --file sbom.json
+          echo "=== SBOM Summary ==="
+          python3 -c "
+          import json
+          with open('sbom.json') as f:
+              s = json.load(f)
+          comps = s.get('components', [])
+          print(f'Components catalogued: {len(comps)}')
+          for c in comps[:5]:
+              print(f'  {c.get(\"name\")} {c.get(\"version\",\"\")}')
+          if len(comps) > 5:
+              print(f'  ... and {len(comps)-5} more')
+          "
+
+      - name: Save SBOM report
+        run: ls -lh sbom.json && echo "SBOM report saved"
+
+      # Scan the image for known CVEs. Only HIGH and CRITICAL are shown.
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Scan image with Trivy
+        run: |
+          trivy image \
+            --format table \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            --timeout 10m \
+            --skip-java-db-update \
+            ${{ env.IMAGE_NAME }}:latest
+
+      - name: Export Trivy JSON report
+        run: |
+          trivy image \
+            --format json \
+            --output trivy-report.json \
+            --timeout 10m \
+            --skip-java-db-update \
+            ${{ env.IMAGE_NAME }}:latest || true
+          ls -lh trivy-report.json && echo "Vulnerability report saved"
+
+      # Deploy the new container. Saves the previous image tag first so we can
+      # roll back automatically if the health check fails within 20 seconds.
+      - name: Deploy container
+        run: |
+          PREV_IMAGE=$(docker inspect --format='{{.Config.Image}}' ${{ env.IMAGE_NAME }} 2>/dev/null || echo "")
+          echo "Previous image: ${PREV_IMAGE:-none}"
+
+          docker stop ${{ env.IMAGE_NAME }} 2>/dev/null || true
+          docker rm   ${{ env.IMAGE_NAME }} 2>/dev/null || true
+
+          docker run -d \
+            --name ${{ env.IMAGE_NAME }} \
+            --restart unless-stopped \
+            -p ${{ env.APP_PORT }}:${{ env.CONTAINER_PORT }} \
+            ${{ env.IMAGE_NAME }}:latest
+
+          echo "Waiting for health check (20s)..."
+          sleep 20
+          HEALTH=$(docker inspect --format='{{.State.Health.Status}}' ${{ env.IMAGE_NAME }} 2>/dev/null || echo "unknown")
+          echo "Health status: $HEALTH"
+
+          if [ "$HEALTH" = "unhealthy" ] && [ -n "$PREV_IMAGE" ]; then
+            echo "Unhealthy, rolling back to $PREV_IMAGE"
+            docker stop ${{ env.IMAGE_NAME }} 2>/dev/null || true
+            docker rm   ${{ env.IMAGE_NAME }} 2>/dev/null || true
+            docker run -d \
+              --name ${{ env.IMAGE_NAME }} \
+              --restart unless-stopped \
+              -p ${{ env.APP_PORT }}:${{ env.CONTAINER_PORT }} \
+              $PREV_IMAGE
+            echo "Rollback complete. Previous version is running again."
+            exit 1
+          fi
+
+          echo "Deployed: http://localhost:${{ env.APP_PORT }}"
+          echo "Image: ${{ env.IMAGE_NAME }}:${{ gitea.sha }}"

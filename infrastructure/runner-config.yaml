@@ -1,0 +1,29 @@
+# Erik Heerke Witteveen | Student 413560
+# DevSecOps Pipeline | Hanze University of Applied Sciences
+# Assessor: Dr Mohsen Kakavand (KAMO)
+#
+# Configuration for the act_runner that picks up jobs from Forgejo.
+# The key settings here are the network name and the Docker socket passthrough.
+# Without these the pipeline jobs cannot reach Forgejo or build Docker images.
+
+log:
+  level: info
+
+runner:
+  file: .runner
+  capacity: 1
+  timeout: 3h
+  insecure: false
+
+cache:
+  enabled: false
+
+container:
+  # Must match the actual Docker network name (Docker Compose prefixes with folder name)
+  network: "infrastructure_devsecops"
+  # Pass the Docker socket in so pipeline jobs can build and run containers
+  options: "-v /var/run/docker.sock:/var/run/docker.sock"
+  valid_volumes:
+    - /var/run/docker.sock
+  docker_host: "-"
+  force_pull: false

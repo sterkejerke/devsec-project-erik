@@ -1,0 +1,87 @@
+# Erik Heerke Witteveen | Student 413560
+# DevSecOps Pipeline | Hanze University of Applied Sciences
+# Assessor: Dr Mohsen Kakavand (KAMO)
+#
+# Full infrastructure stack. Run "docker compose up -d" to start everything.
+# Three services: Forgejo (git + CI), act_runner (pipeline runner), Uptime Kuma (monitoring).
+# The runner waits for Forgejo to be healthy before it starts.
+
+services:
+
+  # Forgejo is the self-hosted git server and CI platform.
+  # Actions are enabled so it can trigger the pipeline on push.
+  # ROOT_URL uses host.docker.internal so the runner can reach it from inside Docker.
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:9
+    container_name: forgejo
+    hostname: forgejo
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      # Use SQLite to keep things simple, no separate database container needed
+      - FORGEJO__database__DB_TYPE=sqlite3
+      - FORGEJO__server__DOMAIN=localhost
+      - FORGEJO__server__ROOT_URL=http://host.docker.internal:3000/
+      - FORGEJO__server__SSH_DOMAIN=localhost
+      # Turn on Actions so the pipeline can run
+      - FORGEJO__actions__ENABLED=true
+      - FORGEJO__actions__DEFAULT_ACTIONS_URL=https://github.com
+      - FORGEJO__log__LEVEL=warn
+      - FORGEJO__service__DISABLE_REGISTRATION=false
+    ports:
+      - "3000:3000"
+      - "222:22"
+    volumes:
+      - forgejo_data:/data
+    networks:
+      - devsecops
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/healthz"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # act_runner picks up pipeline jobs from Forgejo and runs them.
+  # The Docker socket is mounted so it can build and run Docker images during the pipeline.
+  # Runner token comes from the .env file so it is not hardcoded here.
+  runner:
+    image: gitea/act_runner:latest
+    container_name: act_runner
+    depends_on:
+      forgejo:
+        condition: service_healthy
+    environment:
+      - GITEA_INSTANCE_URL=http://host.docker.internal:3000
+      - GITEA_RUNNER_REGISTRATION_TOKEN=${RUNNER_TOKEN}
+      - GITEA_RUNNER_NAME=local-runner
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - runner_data:/data
+      - ./runner-config.yaml:/config.yaml
+    networks:
+      - devsecops
+    restart: unless-stopped
+
+  # Uptime Kuma monitors the app and Forgejo and shows uptime and response time.
+  # Available at http://localhost:3001 after first run.
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: uptime-kuma
+    ports:
+      - "3001:3001"
+    volumes:
+      - uptime_kuma_data:/app/data
+    networks:
+      - devsecops
+    restart: unless-stopped
+
+volumes:
+  forgejo_data:
+  runner_data:
+  uptime_kuma_data:
+
+networks:
+  devsecops:
+    driver: bridge
